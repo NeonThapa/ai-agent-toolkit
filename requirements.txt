@@ -1,0 +1,11 @@
+# requirements.txt
+
+flask
+google-cloud-aiplatform
+google-cloud-storage
+vertexai
+requests
+python-dotenv
+python-docx
+fpdf2
+gunicorn
