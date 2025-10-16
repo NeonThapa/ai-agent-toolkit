@@ -1,258 +1,879 @@
-# main.py - Final Development Version with Local FAISS Search
-
-# --- Imports ---
-import re
 import os
 import io
 import json
-import numpy as np
-import faiss
+import re
 import traceback
+import pandas as pd
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from pinecone import Pinecone
 from flask import Flask, request, jsonify, send_file
 from google.cloud import storage
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 import requests
 from docx import Document
-from fpdf2 import FPDF
-from fpdf2.enums import XPos, YPos
+from fpdf import FPDF
 
-# --- Initialization & Configuration ---
+# --- CONFIGURATION ---
 load_dotenv()
-
-# GCP & Model Config
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "asia-south1"
 BUCKET_NAME = "rag-source-documents"
 METADATA_FILE_PATH = "vector-search-inputs/metadata_lookup.json"
-VECTOR_INPUT_FILE_PATH = "vector-search-inputs/vector_search_input.json"
-LOCAL_INDEX_FILE = "local_app_index.faiss"
-
-# OpenRouter & Model Config
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = "tata-strive-rag"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 EMBEDDING_MODEL = "text-embedding-005"
 RAG_MODEL = "tngtech/deepseek-r1t2-chimera:free"
-TRANSLATION_MODEL = "openrouter/sonoma-sky-alpha"
+TRANSLATION_MODEL = "z-ai/glm-4.5-air:free"
 
-# --- Client Initialization ---
+# Email Configuration
+EMAIL_SENDER = os.environ.get("EMAIL_SENDER_ADDRESS")
+EMAIL_PASSWORD = os.environ.get("EMAIL_SENDER_PASSWORD")
+EMAIL_SENDER_NAME = os.environ.get("EMAIL_SENDER_NAME", "Tata Strive Learning Team")
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+# --- IN-MEMORY DATA STORAGE ---
+course_data = {}  # Will store course duration info
+holiday_data = {}  # Will store holidays by state
+assessment_guidelines = ""  # Will store assessment guidelines
+
+# --- CLIENT INITIALIZATION ---
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 storage_client = storage.Client()
 embedding_model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL)
 app = Flask(__name__)
 
-# --- Data Loading ---
+print("Initializing Pinecone...")
+pc = Pinecone(api_key=PINECONE_API_KEY)
+pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+print("✅ Pinecone index connection established.")
 
-def load_json_from_gcs(bucket_name, file_path):
-    """Downloads and loads a JSON or JSONL file from GCS."""
-    print(f"Loading {file_path} from gs://{bucket_name}...")
-    try:
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(file_path)
-        content = blob.download_as_string()
-        if "vector_search_input" in file_path:
-            return [json.loads(line) for line in content.decode('utf-8').splitlines()]
-        else:
-            return json.loads(content)
-    except Exception as e:
-        print(f"❌ FATAL: Could not load file from GCS. Error: {e}")
-        return None
-
-metadata_lookup = load_json_from_gcs(BUCKET_NAME, METADATA_FILE_PATH)
-id_lookup_data = load_json_from_gcs(BUCKET_NAME, VECTOR_INPUT_FILE_PATH)
-id_lookup = [item['id'] for item in id_lookup_data] if id_lookup_data else []
-
-print(f"Loading local FAISS index from {LOCAL_INDEX_FILE}...")
+print(f"Loading metadata from gs://{BUCKET_NAME}/{METADATA_FILE_PATH}...")
 try:
-    local_index = faiss.read_index(LOCAL_INDEX_FILE)
-    print("✅ Local FAISS index loaded successfully.")
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(METADATA_FILE_PATH)
+    metadata_lookup = json.loads(blob.download_as_string())
+    print("✅ Metadata loaded successfully.")
 except Exception as e:
-    print(f"❌ FATAL: Could not load local FAISS index. Did you run build_local_index.py? Error: {e}")
-    local_index = None
+    print(f"❌ FATAL: Could not load metadata file. Error: {e}")
+    metadata_lookup = {}
 
-# --- Prompt Engineering ---
-PROMPT_TEMPLATES = {
-    "assessment": """You are an expert quiz designer for Tata Strive. Your user is in {location}. Based ONLY on the provided context, create a multiple-choice quiz with 5 questions. Make the questions culturally and geographically relevant to {location}. Each question must have 4 options, with one correct answer clearly marked with "(Correct Answer)".
-CONTEXT: {context}
-USER REQUEST: {user_query}
-QUIZ:""",
-    "lesson_plan": """You are an instructional designer for Tata Strive creating a lesson plan for facilitators in {location}. Using ONLY the provided context, create a structured 30-minute lesson plan. The plan must include a clear learning objective, a list of materials, an engaging activity that would resonate with learners in {location}, and a method for checking understanding.
-CONTEXT: {context}
-USER REQUEST: {user_query}
-LESSON PLAN:""",
-    "content_generator": """You are a creative educational content writer for Tata Strive. Your target audience is in {location}. Using the provided context as a base, generate a supplementary article that expands on the user's request. Make it engaging and use examples relevant to {location}.
-CONTEXT: {context}
-USER REQUEST: {user_query}
-ARTICLE:"""
-}
+# --- LOCATION DETECTION ---
+def detect_location_from_ip(ip_address: str) -> dict:
+    """Detect location from IP address"""
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip_address}")
+        data = response.json()
+        return {
+            "city": data.get("city", ""),
+            "state": data.get("regionName", ""),
+            "country": data.get("country", "India"),
+            "detected": True
+        }
+    except:
+        return {"city": "", "state": "", "country": "India", "detected": False}
 
-# --- Document Generation Tools ---
+def get_suggested_language(state: str) -> str:
+    """Suggest language based on state"""
+    language_map = {
+        "West Bengal": "Bengali",
+        "Maharashtra": "Marathi",
+        "Gujarat": "Gujarati",
+        "Tamil Nadu": "Tamil",
+        "Karnataka": "Kannada",
+        "Kerala": "Malayalam",
+        "Andhra Pradesh": "Telugu",
+        "Telangana": "Telugu",
+        "Odisha": "Odia",
+        "Punjab": "Punjabi",
+        "Haryana": "Hindi",
+        "Rajasthan": "Hindi",
+        "Uttar Pradesh": "Hindi",
+        "Madhya Pradesh": "Hindi",
+        "Bihar": "Hindi"
+    }
+    return language_map.get(state, "English")
 
-def create_docx(content: str, title: str) -> io.BytesIO:
-    """Generates a .docx file, correctly handling **bold** markdown."""
-    document = Document()
-    document.add_heading(title, level=1)
-    content = content.strip()
-    for paragraph_text in content.split('\n'):
-        if not paragraph_text.strip():
-            continue
-        p = document.add_paragraph()
-        parts = re.split(r'(\*\*.*?\*\*)', paragraph_text)
-        for part in parts:
-            if part.startswith('**') and part.endswith('**'):
-                p.add_run(part[2:-2]).bold = True
-            else:
-                p.add_run(part)
-    mem_file = io.BytesIO()
-    document.save(mem_file)
-    mem_file.seek(0)
-    return mem_file
+# --- DATA LOADING FUNCTIONS ---
+def load_course_data(file):
+    """Load course duration data from CSV"""
+    global course_data
+    try:
+        # Read as CSV directly (not Excel)
+        df = pd.read_csv(file)
+        
+        # Store as dictionary: course_name -> duration info
+        for _, row in df.iterrows():
+            course_data[row['name']] = {
+                'id': row['id'],
+                'duration_hours': row.get('cumulative_course_duration', 0),
+                'theory_hours': row.get('domain_theory_hours', 0),
+                'eligibility': row.get('eligibility_criteria', 'Not specified')
+            }
+        print(f"✅ Loaded {len(course_data)} courses")
+        return {"success": True, "courses_loaded": len(course_data)}
+    except Exception as e:
+        print(f"❌ Error loading course data: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
-def create_pdf(content: str, title: str) -> io.BytesIO:
-    """Generates a professionally formatted PDF from markdown-like text content."""
-    pdf = FPDF()
-    pdf.add_page()
-    dejavu_font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
-    if os.path.exists(dejavu_font_path):
-        pdf.add_font('DejaVu', '', dejavu_font_path)
-        pdf.set_font('DejaVu', '', 12)
-    else:
-        print("⚠️ WARNING: DejaVuSans.ttf not found. Using Helvetica.")
-        pdf.set_font("Helvetica", size=12)
-    pdf.set_font(style="B", size=16)
-    pdf.multi_cell(0, 10, text=title, align='C')
-    pdf.ln(10)
-    pdf.set_font(size=12)
-    lines = content.split('\n')
-    QUESTION_BLOCK_HEIGHT = 45
-    for line in lines:
-        line = line.strip()
-        if not line or line.isdigit():
-            continue
-        if re.match(r'^\d+\.', line):
-            if pdf.will_page_break(QUESTION_BLOCK_HEIGHT):
-                pdf.add_page()
-            pdf.ln(5)
-            pdf.set_font(style="B")
-            pdf.multi_cell(0, 7, text=line)
-            pdf.set_font(style="")
-        elif line.startswith(("*Why?*", "*Correct Answer:")):
-            pdf.ln(2)
-            pdf.set_font(style="I")
-            pdf.multi_cell(0, 7, text=line)
-            pdf.set_font(style="")
-        elif re.match(r'^[A-D]\)', line) or "(Correct Answer)" in line:
-            is_correct = "(Correct Answer)" in line
-            if is_correct:
-                pdf.set_font(style="B")
-            pdf.set_x(15)
-            pdf.multi_cell(0, 7, text=line)
-            if is_correct:
-                pdf.set_font(style="")
+def load_holiday_data(file):
+    """Load holiday data from CSV"""
+    global holiday_data
+    try:
+        # Read as CSV directly (not Excel)
+        df = pd.read_csv(file)
+        
+        # Group holidays by state
+        for state in df['Location'].unique():
+            state_holidays = df[df['Location'] == state]
+            holiday_data[state] = []
+            for _, row in state_holidays.iterrows():
+                try:
+                    holiday_date = datetime.strptime(row['HolidayDate'], '%d-%m-%Y')
+                    holiday_data[state].append({
+                        'name': row['Holidays'],
+                        'date': holiday_date,
+                        'day': row['HolidayDay']
+                    })
+                except:
+                    continue
+        print(f"✅ Loaded holidays for {len(holiday_data)} states")
+        return {"success": True, "states_loaded": len(holiday_data)}
+    except Exception as e:
+        print(f"❌ Error loading holiday data: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+def load_assessment_guidelines(content):
+    """Load assessment guidelines from text content"""
+    global assessment_guidelines
+    try:
+        # Content is already bytes from file.read()
+        if isinstance(content, bytes):
+            assessment_guidelines = content.decode('utf-8')
         else:
-            pdf.multi_cell(0, 7, text=line)
-    mem_file = io.BytesIO(pdf.output())
-    mem_file.seek(0)
-    return mem_file
+            assessment_guidelines = str(content)
+        
+        print(f"✅ Loaded assessment guidelines ({len(assessment_guidelines)} chars)")
+        return {"success": True, "guidelines_length": len(assessment_guidelines)}
+    except Exception as e:
+        print(f"❌ Error loading guidelines: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
-# --- Core Logic Functions ---
+def get_holidays_between_dates(state: str, start_date: datetime, end_date: datetime) -> list:
+    """Get holidays for a state between two dates"""
+    if state not in holiday_data:
+        return []
+    
+    holidays = []
+    for holiday in holiday_data[state]:
+        if start_date <= holiday['date'] <= end_date:
+            holidays.append(holiday)
+    return holidays
 
+# --- CORE LOGIC ---
 def perform_rag(query: str, num_neighbors: int = 5) -> tuple[str, list]:
-    """Performs RAG using the local FAISS index."""
-    if not local_index:
-        return "ERROR: Local index is not loaded.", []
+    """Perform RAG search using Pinecone"""
     query_embedding = embedding_model.get_embeddings([query])[0].values
-    query_vector = np.array([query_embedding]).astype('float32')
-    distances, indices = local_index.search(query_vector, num_neighbors)
-    context, sources = "", []
-    for i in indices[0]:
-        if i != -1:
-            chunk_id = id_lookup[i]
-            if chunk_id in metadata_lookup:
-                chunk_data = metadata_lookup[chunk_id]
-                context += chunk_data.get('content', '') + "\n---\n"
-                sources.append(chunk_data.get('title', 'Unknown'))
+    
+    try:
+        query_results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=num_neighbors,
+            include_metadata=True
+        )
+        matches = query_results.get("matches", [])
+    except Exception as e:
+        print(f"❌ ERROR querying Pinecone: {e}")
+        return "ERROR: Could not query the vector database.", []
+    
+    context = ""
+    sources = []
+    for match in matches:
+        if 'metadata' in match:
+            context += match['metadata'].get('text', '') + "\n---\n"
+            sources.append(match['metadata'].get('title', 'Unknown'))
+            
     return context, list(set(sources))
 
-def call_openrouter(prompt: str, model: str) -> str:
-    """Calls the OpenRouter API for generation."""
-    response = requests.post(
-        url=f"{OPENROUTER_API_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}]}
-    )
-    response.raise_for_status()
-    return response.json()['choices'][0]['message']['content']
-
-def translate_text(text: str, language: str) -> str:
-    """Translates text using the specified OpenRouter model."""
-    if not text or language.lower() in ['en', 'english']:
-        return text
-    prompt = f"Translate the following English text into {language}. Provide only the direct translation.\n\n{text}"
-    return call_openrouter(prompt, TRANSLATION_MODEL)
-
-# --- API Handler & Endpoints ---
-
-def handle_creation_request(feature_type: str):
-    """Generic handler for all creation requests."""
+def call_openrouter(system_prompt: str, user_query: str, model: str = RAG_MODEL) -> str:
+    """Call OpenRouter API for text generation with better error handling"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://tatastrive.com",
+        "X-Title": "Tata Strive RAG System"
+    }
+    
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 3000
+    }
+    
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "Invalid JSON request"}), 400
+        print(f"🔄 Calling OpenRouter with model: {model}")
+        response = requests.post(
+            f"{OPENROUTER_API_BASE}/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=60
+        )
         
-        user_query = data.get('query')
-        if not user_query:
-            return jsonify({"error": "Request must include 'query'"}), 400
-
-        target_language = data.get('language', 'English')
-        location = data.get('location', 'India')
-        output_format = data.get('output_format', 'json').lower()
+        if response.status_code != 200:
+            print(f"❌ OpenRouter error: {response.status_code}")
+            print(f"Response: {response.text}")
         
-        context, sources = perform_rag(user_query)
-        if not context.strip():
-            return jsonify({"error": "Could not find any relevant context for the query."}), 404
-
-        prompt = PROMPT_TEMPLATES[feature_type].format(context=context, user_query=user_query, location=location)
+        response.raise_for_status()
+        result = response.json()
         
-        english_answer = call_openrouter(prompt, RAG_MODEL)
-        final_content = translate_text(english_answer, target_language)
-
-        if output_format == 'json':
-            return jsonify({
-                "english_answer": english_answer, "translated_answer": final_content,
-                "language": target_language, "sources": sources
-            })
+        if "choices" not in result or len(result["choices"]) == 0:
+            print(f"❌ No choices in response: {result}")
+            return "Error: Invalid response from API"
         
-        title = f"Tata Strive - {feature_type.replace('_', ' ').title()}"
-        if output_format == 'docx':
-            file_stream = create_docx(final_content, title)
-            return send_file(file_stream, as_attachment=True, download_name=f'{feature_type}.docx',
-                             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        content = result["choices"][0]["message"]["content"]
+        print(f"✅ OpenRouter response received ({len(content)} chars)")
+        return content
         
-        if output_format == 'pdf':
-            file_stream = create_pdf(final_content, title)
-            return send_file(file_stream, as_attachment=True, download_name=f'{feature_type}.pdf', mimetype='application/pdf')
-
-        return jsonify({"error": "Unsupported output_format. Use 'json', 'docx', or 'pdf'."}), 400
-
+    except requests.exceptions.Timeout:
+        print(f"❌ OpenRouter timeout after 60 seconds")
+        return "Error: API request timed out. Please try again."
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ OpenRouter HTTP error: {e}")
+        return f"Error: API returned error {e.response.status_code if hasattr(e, 'response') else 'unknown'}"
     except Exception as e:
-        print(f"❌ An unexpected error occurred: {e}")
+        print(f"❌ OpenRouter error: {str(e)}")
         traceback.print_exc()
-        return jsonify({"error": "An internal server error occurred.", "details": str(e)}), 500
+        return f"Error generating response: {str(e)}"
+
+def translate_text(text: str, target_language: str) -> str:
+    """Translate text to target language using OpenRouter"""
+    if target_language == "English":
+        return text
+        
+    system_prompt = f"Translate the following text to {target_language}. Maintain the original formatting and structure. Only provide the translation, no explanations."
+    return call_openrouter(system_prompt, text, TRANSLATION_MODEL)
+
+# --- PERSONALIZED LEARNING FUNCTIONS ---
+def analyze_assessment_csv(df: pd.DataFrame) -> dict:
+    """Analyze student assessment data"""
+    try:
+        df_latest = df.sort_values('Attempt ID').groupby(['Login ID', 'Question ID']).tail(1)
+        
+        student_performance = df_latest.groupby('Login ID').agg({
+            'Obtained Marks': ['sum', 'count']
+        }).reset_index()
+        
+        student_performance.columns = ['student_id', 'total_marks', 'total_questions']
+        student_performance['percentage'] = (student_performance['total_marks'] / student_performance['total_questions']) * 100
+        
+        weak_students = student_performance[student_performance['percentage'] < 70].to_dict('records')
+        
+        student_details = []
+        for student in weak_students:
+            student_email = student['student_id']
+            failed_df = df_latest[
+                (df_latest['Login ID'] == student_email) & 
+                (df_latest['Answer Status'] == 'Incorrect')
+            ]
+            
+            if not failed_df.empty:
+                student_details.append({
+                    'email': student_email,
+                    'score': f"{int(student['total_marks'])}/{int(student['total_questions'])}",
+                    'percentage': round(student['percentage'], 1),
+                    'failed_questions': failed_df['Question Text'].tolist()
+                })
+        
+        question_performance = df_latest.groupby('Question Text').agg({
+            'Answer Status': lambda x: ((x == 'Correct').sum() / len(x)) * 100
+        }).reset_index()
+        question_performance.columns = ['question', 'success_rate']
+        weak_questions = question_performance[question_performance['success_rate'] < 60].to_dict('records')
+        
+        return {
+            "total_students": len(student_performance),
+            "weak_students": weak_students,
+            "weak_questions": weak_questions,
+            "average_score": student_performance['percentage'].mean(),
+            "student_details": student_details
+        }
+    except Exception as e:
+        print(f"Error analyzing assessment: {e}")
+        traceback.print_exc()
+        return {"error": str(e)}
+
+def extract_topic_from_question(question_text: str) -> str:
+    """Extract key topic from question text for RAG search"""
+    clean_text = re.sub(r'<[^>]+>', '', question_text)
+    clean_text = clean_text.replace('<DOUBLE_QUOTES>', '"')
+    clean_text = clean_text.replace('<COMMA>', ',')
+    clean_text = clean_text.replace('<br>', ' ')
+    clean_text = re.sub(r'Select the correct option\..*$', '', clean_text)
+    clean_text = re.sub(r'\?.*$', '', clean_text)
+    
+    keywords_map = {
+        'hotel': 'hotel definition and types',
+        'restaurant': 'restaurant and food service',
+        'hospitality': 'hospitality industry basics',
+        'sarai': 'traditional accommodation types in India',
+        'dharamshala': 'traditional accommodation types in India',
+        'front office': 'front office department and management',
+        'city hotels': 'hotel classifications and types',
+        'thinnai': 'traditional Indian hospitality culture',
+        'independence': 'history of hotel industry in India',
+        'boat houses': 'resort hotels and specialized accommodations',
+        'dal lake': 'resort hotels and specialized accommodations'
+    }
+    
+    clean_lower = clean_text.lower()
+    for keyword, topic in keywords_map.items():
+        if keyword in clean_lower:
+            return f"Front Desk Associate {topic}"
+    
+    return "Front Desk Associate hospitality basics"
+
+def clean_question_text(question_text: str) -> str:
+    """Clean question text for display"""
+    clean = re.sub(r'<[^>]+>', '', question_text)
+    clean = clean.replace('<DOUBLE_QUOTES>', '"')
+    clean = clean.replace('<COMMA>', ',')
+    clean = clean.replace('<br>', ' ')
+    if len(clean) > 100:
+        clean = clean[:100] + "..."
+    return clean
+
+def generate_personalized_content_for_student(student_email: str, failed_questions: list) -> str:
+    """Generate personalized study content for a student"""
+    topics = [extract_topic_from_question(q) for q in failed_questions]
+    weak_topics = ", ".join(set(topics))
+    
+    all_context = ""
+    for topic in set(topics):
+        context, _ = perform_rag(topic, num_neighbors=3)
+        all_context += context + "\n\n"
+    
+    prompt = f"""You are an expert educator creating personalized remedial content for a Tata Strive Front Desk Associate student.
+
+Student: {student_email}
+Topics they struggled with: {weak_topics}
+
+Questions they got wrong:
+{chr(10).join([f"- {q}" for q in failed_questions])}
+
+Context from knowledge base:
+{all_context}
+
+Create a comprehensive study guide that:
+1. Explains each concept in simple, clear language
+2. Addresses common misconceptions
+3. Provides practical examples relevant to Front Desk Associate work
+4. Includes memory aids and tips
+5. Adds 5 practice questions with detailed explanations
+6. Uses encouraging, supportive tone
+
+Focus on helping them understand these specific topics better."""
+    
+    content = call_openrouter(prompt, "Generate personalized study guide")
+    return content
+
+def send_email_with_pdf(to_email: str, subject: str, body: str, pdf_content: bytes, pdf_name: str) -> bool:
+    """Send HTML email with PDF attachment using Gmail SMTP"""
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['From'] = f"{EMAIL_SENDER_NAME} <{EMAIL_SENDER}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #2c3e50;">Hi Student,</h2>
+                
+                <p>You recently completed the <strong>Front Desk Associate</strong> assessment.</p>
+                
+                {body}
+                
+                <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 12px;">
+                    <p>This is an automated message from Tata Strive Learning Platform.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        pdf_attachment = MIMEApplication(pdf_content, _subtype="pdf")
+        pdf_attachment.add_header('Content-Disposition', 'attachment', filename=pdf_name)
+        msg.attach(pdf_attachment)
+        
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+        
+        print(f"✅ Email sent successfully to {to_email}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to send email to {to_email}: {str(e)}")
+        traceback.print_exc()
+        return False
+
+# --- PROMPTS ---
+ASSESSMENT_PROMPT = """You are an expert educational assessment creator for Tata Strive programs.
+
+GUIDELINES TO FOLLOW:
+{guidelines}
+
+Context from knowledge base:
+{context}
+
+Create an assessment that:
+1. Follows ALL guidelines strictly (MCSS/MCMS format, 4 options, no "All of the above")
+2. Uses Bloom's taxonomy levels 1-2 (Knowledge and Comprehension)
+3. Tests practical understanding
+4. Provides clear marking criteria
+5. Is culturally sensitive and uses inclusive language
+
+Format the output clearly with numbered questions and marking schemes."""
+
+LESSON_PLAN_PROMPT = """You are an expert curriculum designer for Tata Strive programs.
+
+Course Information:
+{course_info}
+
+Holidays to Consider:
+{holidays}
+
+Context from knowledge base:
+{context}
+
+Create a detailed lesson plan that:
+1. Spans the exact course duration ({duration} hours)
+2. EXCLUDES all holidays listed above
+3. EXCLUDES weekends (Saturday/Sunday)
+4. Includes:
+   - Learning objectives
+   - Daily schedule with time allocation
+   - Module-wise breakdown
+   - Assessment strategies
+   - Materials needed
+   - Key takeaways
+
+Make it practical, realistic, and aligned with Tata Strive's teaching methodology.
+Ensure the timeline accounts for holidays and weekends."""
+
+# --- DOCUMENT GENERATION ---
+def generate_docx(content: str, title: str) -> io.BytesIO:
+    """Generate a DOCX document from content"""
+    doc = Document()
+    doc.add_heading(title, 0)
+    
+    paragraphs = content.split('\n')
+    for para in paragraphs:
+        if para.strip():
+            doc.add_paragraph(para)
+    
+    docx_buffer = io.BytesIO()
+    doc.save(docx_buffer)
+    docx_buffer.seek(0)
+    return docx_buffer
+
+def generate_pdf(content: str, title: str) -> io.BytesIO:
+    """Generate a PDF document from content"""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("helvetica", "B", 16)
+    pdf.cell(0, 10, title, ln=True, align="C")
+    pdf.ln(10)
+    
+    pdf.set_font("helvetica", size=11)
+    lines = content.split('\n')
+    for line in lines:
+        if line.strip():
+            clean_line = line.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 5, clean_line)
+            pdf.ln(2)
+    
+    pdf_buffer = io.BytesIO()
+    pdf_content = pdf.output(dest='S').encode('latin-1')
+    pdf_buffer.write(pdf_content)
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+# --- ENDPOINTS ---
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy", 
+        "service": "Tata Strive RAG API",
+        "courses_loaded": len(course_data),
+        "states_with_holidays": len(holiday_data),
+        "guidelines_loaded": len(assessment_guidelines) > 0
+    }), 200
+
+@app.route('/detect_location', methods=['POST'])
+def detect_location():
+    """Detect location from IP and suggest language"""
+    try:
+        data = request.json
+        ip_address = data.get('ip', request.remote_addr)
+        
+        location = detect_location_from_ip(ip_address)
+        suggested_lang = get_suggested_language(location['state'])
+        
+        return jsonify({
+            "location": location,
+            "suggested_language": suggested_lang
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/upload/course_data', methods=['POST'])
+def upload_course_data():
+    """Upload course duration data"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        file = request.files['file']
+        result = load_course_data(file)
+        return jsonify(result), 200 if result['success'] else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/upload/holidays', methods=['POST'])
+def upload_holidays():
+    """Upload holiday data"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        file = request.files['file']
+        result = load_holiday_data(file)
+        return jsonify(result), 200 if result['success'] else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/upload/guidelines', methods=['POST'])
+def upload_guidelines():
+    """Upload assessment guidelines"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        file = request.files['file']
+        result = load_assessment_guidelines(file.read())
+        return jsonify(result), 200 if result['success'] else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/create/assessment', methods=['POST'])
-def create_assessment_endpoint():
-    return handle_creation_request('assessment')
+def create_assessment():
+    """Create an assessment based on a topic"""
+    try:
+        data = request.json
+        topic = data.get('query', '')
+        requirements = data.get('requirements', '')
+        language = data.get('language', 'English')
+        format_type = data.get('output_format', 'json')
+        
+        if not topic:
+            return jsonify({"error": "Query/topic is required"}), 400
+        
+        context, sources = perform_rag(topic)
+        full_query = f"Topic: {topic}\nRequirements: {requirements}"
+        
+        # Use guidelines if available
+        prompt = ASSESSMENT_PROMPT.format(
+            guidelines=assessment_guidelines if assessment_guidelines else "Standard MCQ format with 4 options.",
+            context=context
+        )
+        
+        assessment = call_openrouter(prompt, full_query)
+        translated_assessment = translate_text(assessment, language)
+        
+        if format_type == 'docx':
+            doc_buffer = generate_docx(translated_assessment, f"Assessment: {topic}")
+            return send_file(doc_buffer, as_attachment=True, 
+                           download_name=f"assessment_{topic.replace(' ', '_')}.docx",
+                           mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        elif format_type == 'pdf':
+            pdf_buffer = generate_pdf(translated_assessment, f"Assessment: {topic}")
+            return send_file(pdf_buffer, as_attachment=True,
+                           download_name=f"assessment_{topic.replace(' ', '_')}.pdf",
+                           mimetype='application/pdf')
+        
+        return jsonify({
+            "english_answer": assessment,
+            "translated_answer": translated_assessment,
+            "language": language,
+            "sources": sources
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in create_assessment: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/create/lesson_plan', methods=['POST'])
-def create_lesson_plan_endpoint():
-    return handle_creation_request('lesson_plan')
+def create_lesson_plan():
+    """Create a lesson plan based on a topic"""
+    try:
+        data = request.json
+        topic = data.get('query', '')
+        course_name = data.get('course_name', '')
+        state = data.get('state', 'Corporate')
+        start_date_str = data.get('start_date', '')
+        language = data.get('language', 'English')
+        format_type = data.get('output_format', 'json')
+        
+        if not topic:
+            return jsonify({"error": "Topic is required"}), 400
+        
+        # Get course info if available
+        course_info_str = "Duration not specified"
+        duration_hours = 0
+        if course_name and course_name in course_data:
+            course_info = course_data[course_name]
+            duration_hours = course_info['duration_hours']
+            course_info_str = f"Course: {course_name}\nDuration: {duration_hours} hours\nTheory Hours: {course_info['theory_hours']}\nEligibility: {course_info['eligibility']}"
+        
+        # Get holidays if state and start date provided
+        holidays_str = "No holidays data available"
+        if state and start_date_str and state in holiday_data:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+                # Calculate end date based on duration (assuming 7 hours/day, 5 days/week)
+                days_needed = int(duration_hours / 7) if duration_hours > 0 else 30
+                end_date = start_date + timedelta(days=days_needed * 2)  # Account for weekends
+                
+                holidays = get_holidays_between_dates(state, start_date, end_date)
+                if holidays:
+                    holidays_str = "Holidays to EXCLUDE:\n" + "\n".join([
+                        f"- {h['name']}: {h['date'].strftime('%d %B %Y')} ({h['day']})"
+                        for h in holidays
+                    ])
+            except:
+                pass
+        
+        context, sources = perform_rag(topic)
+        
+        full_query = f"Topic: {topic}\nCreate lesson plan considering all holidays and weekends."
+        prompt = LESSON_PLAN_PROMPT.format(
+            course_info=course_info_str,
+            duration=f"{duration_hours}" if duration_hours > 0 else "unspecified",
+            holidays=holidays_str,
+            context=context
+        )
+        
+        lesson_plan = call_openrouter(prompt, full_query)
+        translated_lesson_plan = translate_text(lesson_plan, language)
+        
+        if format_type == 'docx':
+            doc_buffer = generate_docx(translated_lesson_plan, f"Lesson Plan: {topic}")
+            return send_file(doc_buffer, as_attachment=True,
+                           download_name=f"lesson_plan_{topic.replace(' ', '_')}.docx",
+                           mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        elif format_type == 'pdf':
+            pdf_buffer = generate_pdf(translated_lesson_plan, f"Lesson Plan: {topic}")
+            return send_file(pdf_buffer, as_attachment=True,
+                           download_name=f"lesson_plan_{topic.replace(' ', '_')}.pdf",
+                           mimetype='application/pdf')
+        
+        return jsonify({
+            "english_answer": lesson_plan,
+            "translated_answer": translated_lesson_plan,
+            "language": language,
+            "sources": sources,
+            "holidays_considered": holidays_str
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/create/content', methods=['POST'])
-def create_content_endpoint():
-    return handle_creation_request('content_generator')
+# --- PERSONALIZED LEARNING ENDPOINT ---
+@app.route('/process/assessment_and_email', methods=['POST'])
+def process_assessment_and_email():
+    """Process assessment CSV and automatically email personalized content to weak students"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        file = request.files['file']
+        
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        elif file.filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(file)
+        else:
+            return jsonify({"error": "Invalid file format. Upload CSV or Excel"}), 400
+        
+        print("📊 Analyzing assessment data...")
+        analysis = analyze_assessment_csv(df)
+        
+        if 'error' in analysis:
+            return jsonify({"error": analysis['error']}), 500
+        
+        email_results = []
+        student_details = analysis.get('student_details', [])
+        
+        print(f"📧 Processing {len(student_details)} students who need support...")
+        
+        for student in student_details:
+            try:
+                student_email = student['email']
+                failed_questions = student['failed_questions']
+                score = student['score']
+                percentage = student['percentage']
+                
+                print(f"Generating content for {student_email}...")
+                
+                content = generate_personalized_content_for_student(student_email, failed_questions)
+                
+                pdf_buffer = generate_pdf(content, f"Personalized Study Guide - {student_email}")
+                pdf_bytes = pdf_buffer.getvalue()
+                
+                cleaned_questions = [clean_question_text(q) for q in failed_questions[:5]]
+                
+                body_plain = f"""Hi Student,
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=8081)
+You recently completed the Front Desk Associate assessment.
+
+📊 YOUR RESULTS:
+Score: {score} ({percentage}%)
+Status: Needs Improvement
+
+We've analyzed your performance and created a personalized study guide to help you master the concepts you found challenging.
+
+⚠️ TOPICS YOU STRUGGLED WITH:
+{chr(10).join([f"• {q}" for q in cleaned_questions])}
+
+📎 ATTACHED:
+Your_Personalized_Study_Guide.pdf
+
+This guide includes:
+✓ Clear explanations of each topic
+✓ Practical examples for Front Desk work
+✓ Memory tips and tricks
+✓ Practice questions with answers
+
+💡 TIP: Review this guide before your next attempt!
+
+Best regards,
+{EMAIL_SENDER_NAME}"""
+
+                body_html = f"""
+                <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
+                    <h3 style="color: #2c3e50; margin-top: 0;">📊 YOUR RESULTS:</h3>
+                    <p style="font-size: 18px;"><strong>Score:</strong> {score} ({percentage}%)</p>
+                    <p style="color: #e74c3c;"><strong>Status:</strong> Needs Improvement</p>
+                </div>
+                
+                <p>We've analyzed your performance and created a personalized study guide to help you master the concepts you found challenging.</p>
+                
+                <div style="background-color: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0;">
+                    <h4 style="color: #856404; margin-top: 0;">⚠️ TOPICS YOU STRUGGLED WITH:</h4>
+                    <ul style="color: #856404;">
+                        {chr(10).join([f"<li>{q}</li>" for q in cleaned_questions])}
+                    </ul>
+                </div>
+                
+                <div style="background-color: #d4edda; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                    <h4 style="color: #155724; margin-top: 0;">📎 ATTACHED: Your_Personalized_Study_Guide.pdf</h4>
+                    <p style="color: #155724; margin-bottom: 10px;"><strong>This guide includes:</strong></p>
+                    <ul style="color: #155724;">
+                        <li>Clear explanations of each topic</li>
+                        <li>Practical examples for Front Desk work</li>
+                        <li>Memory tips and tricks</li>
+                        <li>Practice questions with answers</li>
+                    </ul>
+                </div>
+                
+                <p style="background-color: #e3f2fd; padding: 10px; border-left: 4px solid #2196f3; margin: 20px 0;">
+                    <strong>💡 TIP:</strong> Review this guide before your next attempt!
+                </p>
+                
+                <p style="margin-top: 30px;">Best regards,<br><strong>{EMAIL_SENDER_NAME}</strong></p>
+                """
+                
+                subject = "📚 Your Personalized Study Guide - Front Desk Associate"
+                
+                success = send_email_with_pdf(
+                    to_email=student_email,
+                    subject=subject,
+                    body=body_html,
+                    pdf_content=pdf_bytes,
+                    pdf_name=f"Study_Guide_{student_email.split('@')[0]}.pdf"
+                )
+                
+                email_results.append({
+                    "email": student_email,
+                    "status": "✅ Sent" if success else "❌ Failed",
+                    "score": score,
+                    "percentage": percentage
+                })
+                
+            except Exception as e:
+                print(f"Error processing student {student_email}: {str(e)}")
+                email_results.append({
+                    "email": student_email,
+                    "status": f"❌ Error: {str(e)}",
+                    "score": score,
+                    "percentage": percentage
+                })
+        
+        return jsonify({
+            "total_students": analysis['total_students'],
+            "average_score": round(analysis['average_score'], 1),
+            "emails_sent": len([r for r in email_results if "✅" in r['status']]),
+            "email_results": email_results,
+            "weak_questions": analysis['weak_questions']
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in process_assessment_and_email: {str(e)}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/search', methods=['POST'])
+def search():
+    """Direct search endpoint for testing"""
+    try:
+        data = request.json
+        query = data.get('query', '')
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        context, sources = perform_rag(query)
+        
+        return jsonify({
+            "context": context,
+            "sources": sources
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    print("Starting Tata Strive RAG API Server...")
+    app.run(host='0.0.0.0', port=8081, debug=True)

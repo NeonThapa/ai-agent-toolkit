@@ -1,7 +1,7 @@
 # .env
 
 GOOGLE_CLOUD_PROJECT="tatastrive-269409"
-OPENROUTER_API_KEY="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"
+OPENROUTER_API_KEY="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"
 # --- Pinecone (for Vector Search) ---
 PINECONE_API_KEY="pcsk_4kVU6J_5ei355yfB9w5HsrGAid9z57DngTSgWZEiXxneFcZAxAN4cLss5DED4LpnX1nCPY"
 # --- Email Configuration (Gmail SMTP) ---
