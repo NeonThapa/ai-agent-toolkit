@@ -6,6 +6,21 @@ from datetime import datetime
 
 # --- CONFIGURATION ---
 API_BASE_URL = "http://localhost:8081"
+LANGUAGE_OPTIONS = ["English", "Bengali", "Hindi", "Marathi", "Tamil", "Telugu", "Gujarati", "Kannada"]
+STATE_OPTIONS = [
+    "Corporate", "West Bengal", "Maharashtra", "Gujarat", "Tamil Nadu", "Karnataka",
+    "Kerala", "Andhra Pradesh", "Telangana", "Odisha", "Punjab", "Haryana",
+    "Rajasthan", "Uttar Pradesh", "Madhya Pradesh", "Delhi", "Assam"
+]
+CONTENT_TYPE_OPTIONS = [
+    "Learning Guide",
+    "Facilitator Notes",
+    "Workshop Outline",
+    "Learner Handout",
+    "Quick Reference Sheet"
+]
+TONE_OPTIONS = ["Professional", "Friendly", "Motivational", "Coaching", "Inspirational"]
+LENGTH_OPTIONS = ["Brief", "Standard", "In-depth"]
 
 # --- SESSION STATE INITIALIZATION ---
 if 'download_info' not in st.session_state:
@@ -66,8 +81,53 @@ def upload_file_to_api(endpoint: str, file):
         st.error(f"API Error: {e}")
         return None
 
+def render_document_selector(section_key: str, description: str):
+    st.subheader("📚 Select Source Documents")
+    st.markdown(description)
+    
+    docs = st.session_state.get('available_documents', [])
+    search_value = st.text_input(
+        "🔍 Search documents:",
+        key=f"{section_key}_doc_search",
+        placeholder="Type to filter..."
+    )
+    
+    filtered_docs = docs
+    if search_value:
+        filtered_docs = [d for d in docs if search_value.lower() in d.lower()]
+        if not filtered_docs:
+            st.info("No documents matched your search. Clear the filter to see all items.")
+    
+    selected = st.multiselect(
+        "Select documents:",
+        options=filtered_docs,
+        key=f"{section_key}_selected_docs",
+        help="Select one or more documents to ground the AI generation"
+    )
+    
+    if selected:
+        st.success(f"✅ {len(selected)} document(s) selected")
+    else:
+        st.warning("⚠️ Select at least one document to proceed")
+    
+    st.caption("Tip: Use the search box to quickly narrow down long document lists.")
+    st.divider()
+    return selected
+
 # --- STREAMLIT APP LAYOUT ---
 st.set_page_config(page_title="AI Agent Toolkit", layout="wide")
+st.markdown(
+    """
+    <style>
+        .stApp {background-color: #f5f7fb;}
+        .stTabs [role="tab"] {padding: 0.75rem 1.5rem; font-weight: 600;}
+        .stTabs [role="tab"][aria-selected="true"] {background-color: #ffffff; border-bottom: 3px solid #2c7be5;}
+        .status-pill {padding: 0.35rem 0.75rem; border-radius: 999px; background-color: #edf2ff; color: #1d4ed8; font-size: 0.8rem; display: inline-block;}
+        .info-card {background: #ffffff; border-radius: 12px; padding: 1.2rem; box-shadow: 0 10px 20px rgba(15, 23, 42, 0.06);}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # --- LOAD AVAILABLE DOCUMENTS ON STARTUP ---
 if not st.session_state['documents_loaded']:
@@ -101,7 +161,9 @@ with st.sidebar:
             with st.spinner("Loading holiday data..."):
                 result = upload_file_to_api("/upload/holidays", holiday_file)
                 if result and result.get('success'):
-                    st.success(f"✅ Loaded holidays for {result.get('states_loaded')} states")
+                    region_count = result.get('states_loaded') or result.get('regions_loaded') or 0
+                    label = "region" if region_count == 1 else "regions"
+                    st.success(f"✅ Loaded holidays for {region_count} {label}")
                     st.session_state['data_loaded']['holidays'] = True
                 else:
                     st.error("❌ Failed to load holidays")
@@ -120,13 +182,27 @@ with st.sidebar:
     st.divider()
     
     st.subheader("📊 Data Status")
-    st.write("Courses:", "✅" if st.session_state['data_loaded']['courses'] else "⚪")
-    st.write("Holidays:", "✅" if st.session_state['data_loaded']['holidays'] else "⚪")
-    st.write("Guidelines:", "✅" if st.session_state['data_loaded']['guidelines'] else "⚪")
-    st.write("Documents:", f"✅ {len(st.session_state['available_documents'])}" if st.session_state['documents_loaded'] else "⚪")
+    st.markdown(
+        f"<span class='status-pill'>{'✅' if st.session_state['data_loaded']['courses'] else '⚪'} Courses</span>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f"<span class='status-pill'>{'✅' if st.session_state['data_loaded']['holidays'] else '⚪'} Holidays</span>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f"<span class='status-pill'>{'✅' if st.session_state['data_loaded']['guidelines'] else '⚪'} Guidelines</span>",
+        unsafe_allow_html=True
+    )
+    document_status = f"✅ {len(st.session_state['available_documents'])}" if st.session_state['documents_loaded'] else "⚪"
+    st.markdown(
+        f"<span class='status-pill'>{document_status} Documents</span>",
+        unsafe_allow_html=True
+    )
 
 # --- MAIN CONTENT ---
 st.title("🤖 AI Agent Toolkit for Tata Strive")
+st.caption("Design assessments, lesson plans, and tailored learning content in minutes.")
 
 if not st.session_state['detected_location']:
     with st.spinner("Detecting location..."):
@@ -143,9 +219,16 @@ if detected_loc.get('detected'):
 else:
     st.info("📍 Location not detected. Using defaults.")
 
-tab1, tab2, tab4 = st.tabs([
+with st.container():
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Knowledge Base Docs", len(st.session_state.get('available_documents', [])))
+    col2.metric("Courses Loaded", "Yes" if st.session_state['data_loaded']['courses'] else "No")
+    col3.metric("Guidelines Loaded", "Yes" if st.session_state['data_loaded']['guidelines'] else "No")
+
+tab1, tab2, tab3, tab4 = st.tabs([
     "📝 Assessment Creator",
     "🗓️ Lesson Planner",
+    "📘 Content Generator",
     "🎯 Personalized Learning"
 ])
 
@@ -156,41 +239,18 @@ with tab1:
     if not st.session_state['data_loaded']['guidelines']:
         st.warning("⚠️ Upload assessment guidelines in sidebar for enhanced question generation")
     
-    # Document Selection
-    st.subheader("📚 Select Source Documents")
-    st.markdown("*Choose which documents to use for generating the assessment (required)*")
-    
-    # Search filter
-    doc_search = st.text_input("🔍 Search documents:", key="ass_doc_search", placeholder="Type to filter...")
-    
-    # Filter documents based on search
-    filtered_docs = st.session_state['available_documents']
-    if doc_search:
-        filtered_docs = [d for d in filtered_docs if doc_search.lower() in d.lower()]
-    
-    # Multi-select with filtered options
-    selected_ass_docs = st.multiselect(
-        "Select documents:",
-        options=filtered_docs,
-        key="ass_selected_docs",
-        help="Select one or more documents to base the assessment on"
+    selected_ass_docs = render_document_selector(
+        "assessment",
+        "*Choose which documents to use for generating the assessment (required)*"
     )
-    
-    if selected_ass_docs:
-        st.success(f"✅ {len(selected_ass_docs)} document(s) selected")
-    else:
-        st.warning("⚠️ You must select at least one document to proceed")
-    
-    st.divider()
     
     with st.form("assessment_form"):
         assessment_query = st.text_area("Topic for the assessment:", "Create a quiz about greeting guests at a hotel.", key="ass_query")
         
         col1, col2 = st.columns(2)
         with col1:
-            lang_list = ["English", "Bengali", "Hindi", "Marathi", "Tamil", "Telugu", "Gujarati", "Kannada"]
-            default_index = lang_list.index(suggested_lang) if suggested_lang in lang_list else 0
-            assessment_lang = st.selectbox("Language:", lang_list, index=default_index, key="ass_lang")
+            default_index = LANGUAGE_OPTIONS.index(suggested_lang) if suggested_lang in LANGUAGE_OPTIONS else 0
+            assessment_lang = st.selectbox("Language:", LANGUAGE_OPTIONS, index=default_index, key="ass_lang")
         with col2:
             assessment_format = st.radio("Output Format:", ["json", "docx", "pdf"], key="ass_format", horizontal=True)
         
@@ -232,32 +292,10 @@ with tab2:
     if not st.session_state['data_loaded']['holidays']:
         st.warning("⚠️ Upload holiday calendar to exclude holidays.")
     
-    # Document Selection
-    st.subheader("📚 Select Source Documents")
-    st.markdown("*Choose which documents to use for generating the lesson plan (required)*")
-    
-    # Search filter
-    lp_doc_search = st.text_input("🔍 Search documents:", key="lp_doc_search", placeholder="Type to filter...")
-    
-    # Filter documents based on search
-    filtered_lp_docs = st.session_state['available_documents']
-    if lp_doc_search:
-        filtered_lp_docs = [d for d in filtered_lp_docs if lp_doc_search.lower() in d.lower()]
-    
-    # Multi-select with filtered options
-    selected_lp_docs = st.multiselect(
-        "Select documents:",
-        options=filtered_lp_docs,
-        key="lp_selected_docs",
-        help="Select one or more documents to base the lesson plan on"
+    selected_lp_docs = render_document_selector(
+        "lesson_plan",
+        "*Choose which documents to use for generating the lesson plan (required)*"
     )
-    
-    if selected_lp_docs:
-        st.success(f"✅ {len(selected_lp_docs)} document(s) selected")
-    else:
-        st.warning("⚠️ You must select at least one document to proceed")
-    
-    st.divider()
     
     with st.form("lesson_planner_form"):
         lp_query = st.text_area("Topic for the lesson plan:", "A detailed lesson plan for Front Desk Associate training", key="lp_query")
@@ -265,15 +303,13 @@ with tab2:
         col1, col2 = st.columns(2)
         with col1:
             lp_course = st.text_input("Course Name (Optional):", "Front Desk Associate", key="lp_course")
-            state_list = ["Corporate", "West Bengal", "Maharashtra", "Gujarat", "Tamil Nadu", "Karnataka", "Kerala", "Andhra Pradesh", "Telangana", "Odisha", "Punjab", "Haryana", "Rajasthan", "Uttar Pradesh", "Madhya Pradesh", "Delhi", "Assam"]
-            default_state_index = state_list.index(detected_loc.get('state')) if detected_loc.get('state') in state_list else 0
-            lp_state = st.selectbox("State/Location:", state_list, index=default_state_index, key="lp_state")
+            default_state_index = STATE_OPTIONS.index(detected_loc.get('state')) if detected_loc.get('state') in STATE_OPTIONS else 0
+            lp_state = st.selectbox("State/Location:", STATE_OPTIONS, index=default_state_index, key="lp_state")
         
         with col2:
             lp_start_date = st.date_input("Start Date:", value=datetime.now(), key="lp_start_date")
-            lang_list = ["English", "Bengali", "Hindi", "Marathi", "Tamil", "Telugu", "Gujarati", "Kannada"]
-            default_lang_index = lang_list.index(suggested_lang) if suggested_lang in lang_list else 0
-            lp_lang = st.selectbox("Language:", lang_list, index=default_lang_index, key="lp_lang")
+            default_lang_index = LANGUAGE_OPTIONS.index(suggested_lang) if suggested_lang in LANGUAGE_OPTIONS else 0
+            lp_lang = st.selectbox("Language:", LANGUAGE_OPTIONS, index=default_lang_index, key="lp_lang")
         
         lp_format = st.radio("Output Format:", ["json", "docx", "pdf"], key="lp_format", horizontal=True)
         
@@ -309,6 +345,91 @@ with tab2:
     if st.session_state.get('download_info') and 'lesson_plan' in st.session_state['download_info']['file_name']:
         info = st.session_state['download_info']
         st.download_button(label=f"📥 Download {info['file_name']}", data=info['data'], file_name=info['file_name'], mime=info['mime'], use_container_width=True)
+
+# --- TAB 3: CONTENT GENERATOR ---
+with tab3:
+    st.header("🏗️ Build New Learning Content")
+    st.markdown("Create facilitator-ready guides, notes, and learner handouts grounded in Tata Strive knowledge.")
+    
+    selected_content_docs = render_document_selector(
+        "content",
+        "*Ground the content in the most relevant source documents for factual accuracy (required)*"
+    )
+    
+    with st.form("content_generator_form"):
+        content_topic = st.text_area(
+            "Primary topic or brief:",
+            "Create a learner handout on effective body language for front desk associates.",
+            key="content_topic"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            content_type = st.selectbox("Content Type:", CONTENT_TYPE_OPTIONS, key="content_type")
+            tone = st.selectbox("Tone:", TONE_OPTIONS, index=0, key="content_tone")
+            include_practice = st.checkbox("Add a practical activity or checklist", value=True, key="content_include_practice")
+        with col2:
+            audience = st.text_input("Target Audience:", "Front Desk Associate trainees", key="content_audience")
+            length_choice = st.selectbox("Depth:", LENGTH_OPTIONS, index=1, key="content_length")
+            default_lang_index = LANGUAGE_OPTIONS.index(suggested_lang) if suggested_lang in LANGUAGE_OPTIONS else 0
+            content_lang = st.selectbox("Language:", LANGUAGE_OPTIONS, index=default_lang_index, key="content_lang")
+        
+        content_format = st.radio("Output Format:", ["json", "docx", "pdf"], key="content_format", horizontal=True)
+        
+        if st.form_submit_button("Generate Content", use_container_width=True):
+            if not selected_content_docs:
+                st.error("❌ Please select at least one source document before generating")
+            elif not content_topic.strip():
+                st.error("❌ Topic cannot be empty")
+            else:
+                st.session_state['download_info'] = None
+                with st.spinner("Assembling your content package..."):
+                    payload = {
+                        "query": content_topic.strip(),
+                        "content_type": content_type,
+                        "audience": audience.strip() or "Front Desk Associate trainees",
+                        "tone": tone,
+                        "length": length_choice,
+                        "include_practice": include_practice,
+                        "language": content_lang,
+                        "output_format": content_format,
+                        "selected_documents": selected_content_docs
+                    }
+                    result = call_api("/create/content", payload)
+                    
+                    if result:
+                        if content_format == 'json':
+                            st.success("✅ Content generated successfully!")
+                            st.write("### English Version"); st.markdown(result['english_answer'])
+                            if content_lang != "English":
+                                st.write(f"### {content_lang} Version"); st.markdown(result['translated_answer'])
+                            st.write("#### Sources Used:"); st.write(result['sources'])
+                            metadata = result.get('metadata', {})
+                            if metadata:
+                                st.write("#### Generation Settings:")
+                                st.json(metadata)
+                        else:
+                            st.success("✅ Document generated successfully!")
+                            file_extension = 'docx' if content_format == 'docx' else 'pdf'
+                            mime_type = (
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                if file_extension == 'docx' else "application/pdf"
+                            )
+                            st.session_state['download_info'] = {
+                                "data": result,
+                                "file_name": f"content.{file_extension}",
+                                "mime": mime_type
+                            }
+    
+    if st.session_state.get('download_info') and 'content' in st.session_state['download_info']['file_name']:
+        info = st.session_state['download_info']
+        st.download_button(
+            label=f"📥 Download {info['file_name']}",
+            data=info['data'],
+            file_name=info['file_name'],
+            mime=info['mime'],
+            use_container_width=True
+        )
 
 # --- TAB 4: PERSONALIZED LEARNING ---
 with tab4:

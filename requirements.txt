@@ -5,9 +5,12 @@ vertexai
 requests
 python-dotenv
 python-docx
-fpdf
 gunicorn
 pandas
 openpyxl
-pinecone-client
+pinecone
 streamlit
+flask-cors
+markdown-it-py
+weasyprint
+reportlab
